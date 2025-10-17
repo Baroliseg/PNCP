@@ -2,13 +2,14 @@ name: PNCP Seguros (2min 06h–18h BR)
 
 on:
   schedule:
-    # Rodar de 2 em 2 minutos, das 06 às 18 (horário SP = UTC-3)
+    # 06:00–18:00 em São Paulo = 09:00–21:00 UTC
     - cron: "*/2 9-21 * * *"
   workflow_dispatch: {}
 
 jobs:
   coletar:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,38 +37,60 @@ jobs:
       - name: Rodar script PNCP
         run: |
           python consulta_publicacoes_pncp_publica_versao1.py
-          ls -lh *.xlsx || echo "Nenhum arquivo encontrado"
+          ls -lh *.xlsx || echo "Nenhum arquivo gerado ainda"
 
-      - name: Eliminar repetições (dedup do dia)
+      - name: Criar script de deduplicação
         run: |
-          python - << 'PY'
-import os, pandas as pd, json, hashlib, pathlib
+          cat > dedup.py << 'PY'
+import os, pandas as pd, json, hashlib, pathlib, sys
 today = os.environ["HOJE"]
 output = os.environ["OUTPUT"]
-dados = pathlib.Path("estado")
-dados.mkdir(exist_ok=True)
-seen_path = dados / f"chaves_{today}.json"
+pasta_estado = pathlib.Path("estado"); pasta_estado.mkdir(exist_ok=True)
+seen_path = pasta_estado / f"chaves_{today}.json"
 seen = set(json.loads(seen_path.read_text())) if seen_path.exists() else set()
-# Pega arquivo mais recente
-xlsx = sorted(pathlib.Path(".").glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+# arquivo .xlsx mais recente
+cands = sorted(pathlib.Path(".").glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+if not cands:
+    print("Sem .xlsx para processar"); sys.exit(0)
+xlsx = cands[0]
 df = pd.read_excel(xlsx)
-cols = [c.strip().lower() for c in df.columns]
-df.columns = cols
-def key(r):
-    base = (str(r.get('id', '')) or str(r.get('link', '')) or str(r.get('objeto', '')))
-    return hashlib.md5(base.encode()).hexdigest()
-df["k"] = [key(r) for _,r in df.iterrows()]
-new = df[~df["k"].isin(seen)].copy()
-if not new.empty:
-    seen |= set(new["k"])
-    new.drop(columns=["k"]).to_excel(output, index=False)
-    seen_path.write_text(json.dumps(sorted(seen)))
-    print(f"{len(new)} novidades salvas: {output}")
-else:
+# normaliza colunas
+df.columns = [str(c).strip().lower() for c in df.columns]
+
+# gera chave única por linha
+def make_key(row):
+    for c in ("id","idpublicacao","idcompra","link","url","numero","número"):
+        if c in row and str(row[c]).strip():
+            return f"{c}:{str(row[c]).strip()}"
+    base = "||".join(str(row.get(c,"")).strip() for c in ("objeto","processo","órgão","orgao","uf","municipio"))
+    return "md5:" + hashlib.md5(base.encode("utf-8")).hexdigest()
+
+df["_k"] = [make_key(r) for _, r in df.iterrows()]
+novas = df[~df["_k"].isin(seen)].copy()
+
+if novas.empty:
+    open("SEM_NOVIDADES","w").write("sem novidades")
     print("Sem novidades novas.")
+else:
+    seen |= set(novas["_k"])
+    seen_path.write_text(json.dumps(sorted(seen)))
+    novas.drop(columns=["_k"]).to_excel(output, index=False)
+    print(f"{len(novas)} novidades -> {output}")
 PY
 
-      - name: Salvar resultado e estado
+      - name: Executar deduplicação
+        run: |
+          python dedup.py
+
+      - name: Publicar artefato (se houve novidades)
+        if: ${{ !hashFiles('SEM_NOVIDADES') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT }}
+          path: ${{ env.OUTPUT }}
+
+      - name: Salvar estado e resultados no branch 'dados'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
