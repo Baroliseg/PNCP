@@ -1,0 +1,80 @@
+name: PNCP Seguros (2min 06h–18h BR)
+
+on:
+  schedule:
+    # Rodar de 2 em 2 minutos, das 06 às 18 (horário SP = UTC-3)
+    - cron: "*/2 9-21 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  coletar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests openpyxl python-dotenv
+
+      - name: Definir filtros (Brasil + Seguros)
+        run: |
+          echo "TZ=America/Sao_Paulo" >> $GITHUB_ENV
+          echo "UFS=AC,AL,AP,AM,BA,CE,DF,ES,GO,MA,MT,MS,MG,PA,PB,PR,PE,PI,RJ,RN,RS,RO,RR,SC,SP,SE,TO" >> $GITHUB_ENV
+          echo "DIAS_ATRAS=1" >> $GITHUB_ENV
+          echo 'PALAVRAS_CHAVE=seguro;apólice;corretora de seguros;prêmio de seguro;endosso;seguro garantia;garantia contratual;performance bond;seguro de vida;acidentes pessoais;vida em grupo;seguro funeral;seguro saúde;plano de saúde;assistência saúde;seguro patrimonial;seguro empresarial;seguro multirrisco;seguro auto;frota;seguro de veículos;casco;responsabilidade civil;RC geral;RC profissional;RC obras;riscos de engenharia;obra civil;instalação e montagem;seguro transporte;carga;cascos marítimos;RC transportador;seguro cyber;cibernético;dados;LGPD;seguro ambiental;RC ambiental;seguro de equipamentos;máquinas;roubo e furto qualificado' >> $GITHUB_ENV
+          echo "TS=$(TZ=America/Sao_Paulo date +'%Y%m%d_%H%M')" >> $GITHUB_ENV
+          echo "HOJE=$(TZ=America/Sao_Paulo date +'%Y%m%d')" >> $GITHUB_ENV
+          echo "OUTPUT=novidades_pncp_${TS}.xlsx" >> $GITHUB_ENV
+
+      - name: Rodar script PNCP
+        run: |
+          python consulta_publicacoes_pncp_publica_versao1.py
+          ls -lh *.xlsx || echo "Nenhum arquivo encontrado"
+
+      - name: Eliminar repetições (dedup do dia)
+        run: |
+          python - << 'PY'
+import os, pandas as pd, json, hashlib, pathlib
+today = os.environ["HOJE"]
+output = os.environ["OUTPUT"]
+dados = pathlib.Path("estado")
+dados.mkdir(exist_ok=True)
+seen_path = dados / f"chaves_{today}.json"
+seen = set(json.loads(seen_path.read_text())) if seen_path.exists() else set()
+# Pega arquivo mais recente
+xlsx = sorted(pathlib.Path(".").glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)[0]
+df = pd.read_excel(xlsx)
+cols = [c.strip().lower() for c in df.columns]
+df.columns = cols
+def key(r):
+    base = (str(r.get('id', '')) or str(r.get('link', '')) or str(r.get('objeto', '')))
+    return hashlib.md5(base.encode()).hexdigest()
+df["k"] = [key(r) for _,r in df.iterrows()]
+new = df[~df["k"].isin(seen)].copy()
+if not new.empty:
+    seen |= set(new["k"])
+    new.drop(columns=["k"]).to_excel(output, index=False)
+    seen_path.write_text(json.dumps(sorted(seen)))
+    print(f"{len(new)} novidades salvas: {output}")
+else:
+    print("Sem novidades novas.")
+PY
+
+      - name: Salvar resultado e estado
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin || true
+          git checkout -B dados
+          mkdir -p resultados estado
+          if [ -f $OUTPUT ]; then mv $OUTPUT resultados/$OUTPUT; fi
+          git add resultados estado
+          git commit -m "Atualização ${OUTPUT}" || echo "Nada novo"
+          git push origin dados --force
